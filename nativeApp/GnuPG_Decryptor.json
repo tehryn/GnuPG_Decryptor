@@ -1,6 +1,6 @@
 {
   "name": "GnuPG_Decryptor",
-  "description": "TODO",
+  "description": "Native application for GnuPG Decryptor web browser extension.",
   "path": "/mnt/sdb1/FIT/diploma-thesis/nativeApp/gnupg_decryptor.py",
   "type": "stdio",
   "allowed_extensions": [ "GnuPG_Decryptor@fit.vutbr.cz" ]

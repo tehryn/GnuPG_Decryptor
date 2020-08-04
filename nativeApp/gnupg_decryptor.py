@@ -1,21 +1,22 @@
+#!/usr/bin/python3 -u
 """
 Author: Jiri Matejka
 Description: This module is native application of GnuPG_Decryptor broswer extension.
 """
-#!/usr/bin/python3 -u
 
 # Note that running python with the `-u` flag is required on Windows,
 # in order to ensure that stdin and stdout are opened in binary, rather
 # than text, mode.
 
-import json
 import sys
-import struct
-import base64
-import subprocess
-import magic
+from json import loads, dumps
+from struct import pack, unpack
+from base64 import b64encode, b64decode
+from subprocess import Popen, PIPE
+from threading import Thread, Lock
 from PyQt5.QtWidgets import QApplication
-from GUI import GnuPG_Decryptor_GUI
+from magic import Magic
+from GnuPG_Decryptor_GUI import GnuPG_Decryptor_GUI
 
 class GnuPG_Decryptor:
     """
@@ -29,6 +30,9 @@ class GnuPG_Decryptor:
         self._QApp      = None
         self._sudo      = None
         self._homedir   = None
+        self.MAX_MESSAGE_SIZE = 750 * 1024
+        self.mimeResolver     = Magic( mime=True )
+        self._lock      = Lock()
 
     def show( self ):
         """
@@ -39,9 +43,9 @@ class GnuPG_Decryptor:
         if( self._gui is None ):
             self._QApp = QApplication( sys.argv )
             initKeys = []
-            for keyId, password in self._passwords:
+            for keyId, password in self._passwords.items():
                 initKeys.append( { 'id' : keyId, 'password' : password } )
-            self._gui  = GnuPG_Decryptor_GUI( self, initKeys )
+            self._gui  = GnuPG_Decryptor_GUI( self, initKeys, self._sudo, self._homedir )
 
         # show the window
         self._gui.show()
@@ -75,7 +79,7 @@ class GnuPG_Decryptor:
         args.append( '--list-secret-keys' )
 
         # call subprocess
-        process = subprocess.Popen( args ,stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+        process = Popen( args ,stdin=PIPE, stdout=PIPE, stderr=PIPE )
         stdout, _ = process.communicate( stdin.encode() )
         retcode = process.returncode
         ids    = []
@@ -83,11 +87,7 @@ class GnuPG_Decryptor:
         # if success
         if ( retcode == 0 ):
             stdout = stdout.decode().splitlines()
-            uids   = [ line[3:].strip() for line in stdout if line.startswith( 'uid' ) ]
-            for line in uids:
-                idx = line.find( ' ' )
-                ids.append( { 'id' : line[ idx + 1 : ], 'password' : '' } )
-
+            ids    = [ { 'id' : line[25:].strip(), 'password' : '' } for line in stdout if line.startswith( 'uid' ) ]
         return { 'returnCode' : retcode, 'keys' : ids }
 
     def setPasswords( self, config ):
@@ -135,7 +135,7 @@ class GnuPG_Decryptor:
         args.append( keyId )
 
         # call subprocess
-        process   = subprocess.Popen( args ,stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+        process   = Popen( args ,stdin=PIPE, stdout=PIPE, stderr=PIPE )
         stdout, _ = process.communicate()
         retcode   = process.returncode
         uid       = None
@@ -143,11 +143,9 @@ class GnuPG_Decryptor:
         # if success
         if ( retcode == 0 ):
             stdout = stdout.decode().splitlines()
-            uids   = [ line[3:].strip() for line in stdout if line.startswith( 'uid' ) ]
+            uids    = [ line[25:].strip() for line in stdout if line.startswith( 'uid' ) ]
             if ( uids ):
                 uid = uids[0]
-                idx = uid.find( ' ' )
-                uid = uid[ idx + 1 : ]
         return uid
 
     def getKeyUidFromData( self, data ):
@@ -156,27 +154,26 @@ class GnuPG_Decryptor:
         """
 
         # command line arguments
-        args = [ 'gpg', '-d', '--list-only' ]
+        args = [ 'gpg', '--list-packets', '--list-only' ]
 
         # call gpg
-        process = subprocess.Popen( args ,stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
-        _, stderr = process.communicate( data )
+        process = Popen( args ,stdin=PIPE, stdout=PIPE, stderr=PIPE )
+        stdout, _ = process.communicate( data )
         retcode = process.returncode
         keys  = []
 
         # if success
         if ( retcode == 0 ):
             # output is on stderr
-            stderr   = stderr.decode().splitlines()
+            stdout   = stdout.decode().splitlines()
             # we care only about lines starting with "gpg: encrypted"
-            filtered = [ line for line in stderr if line.startswith( 'gpg: encrypted' )  ]
+            filtered = [ line for line in stdout if line.startswith( ':pubkey' )  ]
             for line in filtered:
                 # find where ID/fingerprint is
-                idx1 = line.find( ', ID' ) + 5
+                idx1 = line.find( 'keyid ' ) + 6
                 idx2 = line.find( ',', idx1 )
                 if ( idx2 == -1 ):
                     idx2 = len( line )
-
                 # get uid from id/fingerprint
                 uid = self.getKeyUidFromId( line[ idx1 : idx2 ] )
                 if ( not uid is None ):
@@ -192,9 +189,9 @@ class GnuPG_Decryptor:
 
         if not raw_length:
             sys.exit( 0 )
-        message_length = struct.unpack( '=I', raw_length )[0]
+        message_length = unpack( '=I', raw_length )[0]
         message = sys.stdin.buffer.read( message_length ).decode( "utf-8" )
-        return json.loads( message )
+        return loads( message )
 
 
     @staticmethod
@@ -203,52 +200,136 @@ class GnuPG_Decryptor:
         Encode a message for transmission, given its content.
         """
 
-        encoded_content = json.dumps( message_content ).encode( "utf-8" )
-        encoded_length  = struct.pack( '=I', len( encoded_content ) )
-        return { 'length' : encoded_length, 'content' : struct.pack( str( len(encoded_content ) ) + "s", encoded_content ) }
+        encoded_content = dumps( message_content ).encode( "utf-8" )
+        encoded_length  = pack( '=I', len( encoded_content ) )
+        return { 'length' : encoded_length, 'content' : pack( str( len(encoded_content ) ) + "s", encoded_content ) }
 
 
-    @staticmethod
-    def send_message( encoded_message ):
+    def send_message( self, encoded_message ):
         """
         Sends an encoded message to background script.
         """
+        with self._lock:
+            sys.stdout.buffer.write( encoded_message[ 'length' ] )
+            sys.stdout.buffer.write( encoded_message[ 'content' ] )
+            sys.stdout.buffer.flush()
 
-        sys.stdout.buffer.write( encoded_message[ 'length' ] )
-        sys.stdout.buffer.write( encoded_message[ 'content' ] )
-        sys.stdout.buffer.flush()
-
-    @staticmethod
-    def debug( messageString ):
+    def debug( self, messageString ):
         """
         Sends debug message to background script
         """
-        GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'message' : messageString, 'type' : 'debug' } ) )
+        self.send_message( GnuPG_Decryptor.encode_message( { 'message' : messageString, 'type' : 'debug' } ) )
 
-    @staticmethod
-    def loadKeys():
+    def loadKeys( self ):
         """
         Asks background scripts for stored keys.
         """
-        GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'type' : 'getKeysRequest' } ) )
+        self.send_message( GnuPG_Decryptor.encode_message( { 'type' : 'getKeysRequest' } ) )
 
     def updateKeys( self ):
         """
         Update keys in background scripts
         """
-        GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'type' : 'updateKeysRequest', 'keys' : self._passwords } ) )
+        keys = self._passwords.copy()
+        for key in keys.keys():
+            keys[ key ] = ''
+        message = { 'type' : 'updateKeysRequest', 'keys' : keys }
+        if ( not self._sudo is None ):
+            message[ 'sudo' ] = 1
+        else:
+            message[ 'sudo' ] = 0
+
+        if ( not self._homedir is None ):
+            message[ 'homedir' ] = self._homedir
+
+        self.send_message( GnuPG_Decryptor.encode_message( message ) )
+
+    def decrypt( self, rawData, keys, messageId, tabId ):
+        """
+        Decrypts the data and sends decrypted content to the content script.
+        """
+        err     = b''
+        retcode = 0
+        for key in keys:
+            args     = []
+            sudoPass = ''
+            keyPass  = self._passwords[ key ]
+
+            # if sudo should be used
+            if ( not self._sudo is None ):
+                args.append( 'sudo' )
+                args.append( '-Sk' )
+                sudoPass = self._sudo + '\n'
+
+            # gpp argument
+            args.append( 'gpg' )
+
+            # if homedir should be used
+            if ( not self._homedir is None ):
+                args.append( '--homedir' )
+                args.append( self._homedir )
+
+            # be quiet as possible
+            args.append( '--quiet' )
+
+            # use password if we know it
+            if ( keyPass ):
+                args.append( '--no-tty' )
+                args.append( '--pinentry-mode=loopback' )
+                args.append( '--passphrase' )
+                args.append( keyPass )
+
+            # decrypt command for gpg
+            args.append( '--decrypt' )
+
+            # call subprocess
+            process = Popen( args ,stdin=PIPE, stdout=PIPE, stderr=PIPE )
+            decrypted, err = process.communicate( sudoPass.encode() + rawData )
+            retcode = process.returncode
+
+            # if decryption failed, try next key
+            if ( retcode != 0 ):
+                continue
+
+            # get mimeType of data
+            mimeType  = self.mimeResolver.from_buffer( decrypted )
+
+            # encode data using base64
+            decrypted = b64encode( decrypted )
+
+            # split data into blocks
+            blocks    = [ decrypted[ i : i + self.MAX_MESSAGE_SIZE ] for i in range( 0, len( decrypted ), self.MAX_MESSAGE_SIZE ) ]
+
+            # get last block of data
+            lastBlock = blocks.pop()
+
+            # prepare response
+            response  = { 'messageId' : messageId, 'success' : 1, 'message' : '', 'type' : 'decryptResponse', 'data' : '', 'encoding' : 'base64', 'mimeType' : mimeType, 'lastBlock' : 0, 'tabId' : tabId }
+
+            # send all blocks, except last one
+            for block in blocks:
+                response[ 'data' ]  = block.decode()
+                self.send_message( GnuPG_Decryptor.encode_message( response ) )
+
+            # send last blocks
+            response[ 'data' ]      = lastBlock.decode()
+            response[ 'lastBlock' ] = 1
+            self.send_message( GnuPG_Decryptor.encode_message( response ) )
+            break
+        if ( retcode != 0 ):
+            errorMessage = 'Unable to decrypt data: ' + err.decode()
+            self.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : messageId, 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
+        elif ( not keys ):
+            errorMessage = 'Unable to decrypt data: Required key is not present'
+            self.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : messageId, 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
 
     def main( self ):
         """
         Reads messages from background scripts and create responses.
         """
-
-        mimeResolver     = magic.Magic( mime=True )
         largeRequests    = dict()
-        MAX_MESSAGE_SIZE = 750 * 1024
-
         # load stored keys
-        GnuPG_Decryptor.loadKeys()
+        self.loadKeys()
         while True:
             # read message
             message      = GnuPG_Decryptor.get_message()
@@ -261,12 +342,12 @@ class GnuPG_Decryptor:
 
                 # decode data
                 if ( message[ 'encoding' ] == 'base64' ):
-                    rawData = base64.b64decode( message[ 'data' ] )
+                    rawData = b64decode( message[ 'data' ] )
                 elif ( message[ 'encoding' ] == 'ascii' ):
                     rawData = message[ 'data' ].encode()
                 else:
                     errorMessage = 'Invalid encoding: ' + message[ 'encoding' ]
-                    GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : message[ 'messageId' ], 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
+                    self.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : message[ 'messageId' ], 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
                     continue
 
                 # data are split into blocks, join those blocks
@@ -275,7 +356,6 @@ class GnuPG_Decryptor:
                     continue
                 elif ( message[ 'messageId' ] in largeRequests ):
                     rawData = largeRequests[ message[ 'messageId' ] ] + rawData
-                    GnuPG_Decryptor.debug( 'Message is commplete' )
                     del( largeRequests[ message[ 'messageId' ] ] )
 
                 # get key, that was used for encryption
@@ -283,83 +363,18 @@ class GnuPG_Decryptor:
 
                 # use only keys that are available
                 keys = [ key for key in keys if key in self._passwords ]
-
+                #start_time = time.time()
+                t1 = Thread(target = self.decrypt, args = ( rawData, keys, message[ 'messageId' ], tabId ) )
+                t1.start()
                 # if we have at least one valid key, decrypt data
-                if ( keys ):
-                    args     = []
-                    sudoPass = ''
-                    keyPass  = self._passwords[ keys[0] ]
-
-                    # if sudo should be used
-                    if ( not self._sudo is None ):
-                        args.append( 'sudo' )
-                        args.append( '-Sk' )
-                        sudoPass = self._sudo + '\n'
-
-                    # gpp argument
-                    args.append( 'gpg' )
-
-                    # if homedir should be used
-                    if ( not self._homedir is None ):
-                        args.append( '--homedir' )
-                        args.append( self._homedir )
-
-                    # be quiet as possible
-                    args.append( '--quiet' )
-
-                    # use password if we know it
-                    if ( keyPass ):
-                        args.append( '--pinentry-mode=loopback' )
-                        args.append( '--passphrase' )
-                        args.append( keyPass )
-
-                    # decrypt command for gpg
-                    args.append( '--decrypt' )
-
-                    # call subprocess
-                    process = subprocess.Popen( args ,stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
-                    decrypted, err = process.communicate( sudoPass.encode() + rawData )
-                    retcode = process.returncode
-
-                    # if decryption failed
-                    if ( retcode != 0 ):
-                        errorMessage = 'Unable to decrypt data: ' + err.decode()
-                        GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : message[ 'messageId' ], 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
-                        continue
-
-                    # get mimeType of data
-                    mimeType  = mimeResolver.from_buffer( decrypted )
-
-                    # encode data using base64
-                    decrypted = base64.b64encode( decrypted )
-
-                    # split data into blocks
-                    blocks    = [ decrypted[ i : i + MAX_MESSAGE_SIZE ] for i in range( 0, len( decrypted ), MAX_MESSAGE_SIZE ) ]
-
-                    # get last block of data
-                    lastBlock = blocks.pop()
-
-                    # prepare response
-                    response  = { 'messageId' : message[ 'messageId' ], 'success' : 1, 'message' : '', 'type' : 'decryptResponse', 'data' : '', 'encoding' : 'base64', 'mimeType' : mimeType, 'lastBlock' : 0, 'tabId' : tabId }
-
-                    # send all blocks, except last one
-                    for block in blocks:
-                        response[ 'data' ]  = block.decode()
-                        GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( response ) )
-
-                    # send last blocks
-                    response[ 'data' ]      = lastBlock.decode()
-                    response[ 'lastBlock' ] = 1
-                    GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( response ) )
-                else:
-                    errorMessage = 'Unable to decrypt data: Required key is not present'
-                    GnuPG_Decryptor.send_message( GnuPG_Decryptor.encode_message( { 'messageId' : message[ 'messageId' ], 'success' : 0, 'message' : errorMessage, 'type' : 'decryptResponse', 'data' : '', 'tabId' : tabId } ) )
             elif ( message[ 'type' ] == 'displayWindow' ):
                 # User clicked on icon - diplay window
                 self.show()
             elif ( message[ 'type' ] == 'getKeysResponse' ):
                 # Set new keys
                 self._passwords = message[ 'keys' ]
+                self._homedir   = message[ 'homedir' ] if 'homedir' in message else None
+                self._sudo      = '' if 'sudo' in message and message[ 'sudo' ] else None
 
 app = GnuPG_Decryptor()
 app.main()
