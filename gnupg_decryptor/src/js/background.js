@@ -8,8 +8,7 @@
 /* jshint browser: true */
 /* jshint -W080 */
 
-var browser     = browser || chrome;
-var keys        = {};
+var browser = browser || chrome;
 
 // Connects to native application
 let port = browser.runtime.connectNative( "GnuPG_Decryptor" );
@@ -17,9 +16,11 @@ let port = browser.runtime.connectNative( "GnuPG_Decryptor" );
 // Listens to messages from native application.
 port.onMessage.addListener(
     ( message ) => {
+        //let getting = browser.storage.local.get( 'keys' );
+        //getting.then( onGot, onError );
+
         // Message contains decrypted content - forward it to content script
         if ( message.type === 'decryptResponse' ){
-            console.log( message );
             browser.tabs.sendMessage( message.tabId, message, null );
         }
         // Message contains debug information - log it into console
@@ -28,12 +29,15 @@ port.onMessage.addListener(
         }
         // List of keys need to be update it - store it
         else if ( message.type === 'updateKeysRequest' ) {
-            keys = message.keys;
+            delete( message.type );
+            browser.storage.local.set({
+                'nativeApp' : message
+            });
         }
         // Native application require list of keys
         else if ( message.type === 'getKeysRequest' ) {
-            response = { 'type' : 'getKeysResponse', 'keys' : keys };
-            port.postMessage( response );
+            let getting = browser.storage.local.get( 'nativeApp' );
+            getting.then( onGot, onError );
         }
     }
 );
@@ -59,3 +63,22 @@ browser.browserAction.onClicked.addListener(
         port.postMessage( { 'type' : 'displayWindow' } );
     }
 );
+
+function onGot( item ) {
+    if ( 'nativeApp' in item ) {
+        let response = item.nativeApp;
+        response.type = 'getKeysResponse';
+        if ( !('keys' in response) ) {
+            response.keys = {};
+        }
+        port.postMessage( response );
+    }
+    else {
+        port.postMessage( { 'type' : 'getKeysResponse', 'keys' : {} } );
+    }
+}
+
+function onError( error ) {
+    response = { 'type' : 'getKeysResponse', 'keys' : {} };
+    port.postMessage( response );
+}

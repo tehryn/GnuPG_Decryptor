@@ -6,8 +6,8 @@
 const encoder = new TextEncoder();
 var browser = browser || chrome;
 
-// Maximum size of data part of message (Maximum size of single message is 4 GiB)
-let MAX_MESSAGE_SIZE = 3 * 1024 * 1024 * 1024; // 3 GiB
+// Maximum size of data part of message (Maximum size of single message is 4 GB)
+let MAX_MESSAGE_SIZE = 3 * 1000 * 1000 * 1000; // 3 GB
 
 // Id counter for elements
 let elemId   = 0;
@@ -34,16 +34,18 @@ browser.runtime.onMessage.addListener(
                 // Decrypted data were seperated into blocks - load all blocks
                 if ( message.lastBlock === 0 ) {
                     if ( typeof blocks[ message.messageId ] === 'undefined' ) {
-                        blocks[ message.messageId ] = message.data;
+                        blocks[ message.messageId ] = [ message.data ];
                     }
                     else {
-                        blocks[ message.messageId ] += message.data;
+                        blocks[ message.messageId ].push( message.data );
                     }
                 }
                 else {
                     // last block of data is received -- append it to blocks[ message.messageId ]
                     if ( typeof blocks[ message.messageId ] !== 'undefined' ) {
-                        message.data = blocks[ message.messageId ] + message.data;
+                        blocks[ message.messageId ].push( message.data );
+                        message.data = blocks[ message.messageId ].join( '' );
+                        delete blocks[ message.messageId ];
                     }
 
                     // Get the encrypted element
@@ -77,16 +79,33 @@ browser.runtime.onMessage.addListener(
                         // Then we create URL to BLOB
                         let url = URL.createObjectURL( blob );
 
+                        fileUrl = elem.hasAttribute( 'src' ) ? elem.src : elem.href;
+
                         // And we update all src attributes poiting to encrypted file with url pointing to decrypted one
-                        cache[ elem.src ].url    = url;
-                        cache[ elem.src ].status = 'decrypted';
-                        cache[ elem.src ].elements.forEach(
-                            function ( id, index ) {
-                                elem = document.getElementById( id );
-                                elem.src = url;
-                                // Audio and Video need to be reloaded
-                                if ( elem.parentNode && ( elem.parentNode.tagName === 'VIDEO' || elem.parentNode.tagName === 'AUDIO' ) ) {
-                                    elem.parentNode.load();
+                        cache[ fileUrl ].url = url;
+                        cache[ fileUrl ].status = 'decrypted';
+                        cache[ fileUrl ].elements.forEach(
+                            function ( info, index ) {
+                                elem = document.getElementById( info.id );
+                                if ( info.attribute === 'src' ) {
+                                    elem.src = url;
+                                    // Audio and Video need to be reloaded
+                                    if ( elem.parentNode && ( elem.parentNode.tagName === 'VIDEO' || elem.parentNode.tagName === 'AUDIO' ) ) {
+                                        elem.parentNode.load();
+                                    }
+                                    else if ( elem.parentNode && ( elem.tagName === 'SCRIPT' ) ) {
+                                        let copy = document.createElement( 'script' );
+                                        let parent = elem.parentNode;
+                                        elem.remove();
+
+                                        copy.id  = elem.id;
+                                        copy.src = elem.src;
+                                        copy.innerHTML = elem.innerHTML;
+                                        parent.appendChild( copy );
+                                    }
+                                }
+                                else {
+                                    elem.href = url;
                                 }
                             }
                         );
@@ -141,7 +160,7 @@ function setTabId() {
  * Connects mutation observer to document, detects all encrypted elements and sends it to native application
  */
 function main() {
-    let mutObservConfig = { attributes : true, attributeFilter : [ 'src' ], childList : true, subtree : true };
+    let mutObservConfig = { attributes : true, attributeFilter : [ 'src', 'href' ], childList : true, subtree : true };
     let mutObserver = new MutationObserver(
         function( mutatuinList, observer ) {
             for ( let mutation of mutatuinList ) {
@@ -169,13 +188,13 @@ function parseElements( elements ) {
             if ( !elem.data.id ) {
                 elem.data.id = id = getId();
             }
-
             if ( elem.type === 'file' ) {
                 // We are parsing encrypted file, so we try if we already parsed one
-                if ( cache[ elem.data.src ] === undefined ) {
+                fileURL = elem.attribute === 'src' ? elem.data.src : elem.data.href;
+                if ( cache[ fileURL ] === undefined ) {
                     // File is not in cache, so we create an entry
                     file = elem.data;
-                    cache[ file.src ] = { 'status' : 'creatingRequset', 'type' : 'file', 'url' : elem.data.src, 'elements' : [ id ] };
+                    cache[ fileURL ] = { 'status' : 'creatingRequset', 'type' : 'file', 'url' : fileURL, 'elements' : [ { 'id' : id, 'attribute' : elem.attribute } ] };
 
                     // We need to load content of the file
                     let reader = new FileReader();
@@ -186,11 +205,11 @@ function parseElements( elements ) {
                         let message   = { 'data' : encrypted, 'type' : 'decryptRequest', encoding : 'base64', messageId : id };
                         types[ id ] = 'file';
                         sendMessage( message );
-                        cache[ elem.data.src ].status = 'decrypting';
+                        cache[ fileURL ].status = 'decrypting';
                     };
 
                     // We read the file as array buffer
-                    getFile( elem.data.preParsedData ? elem.data.preParsedData : file.src, 'blob' ).then(
+                    getFile( elem.data.preParsedData ? elem.data.preParsedData : fileURL, 'blob' ).then(
                         function( data ) {
                             reader.readAsArrayBuffer( data );
                         }
@@ -198,14 +217,19 @@ function parseElements( elements ) {
                 }
                 else {
                     // File is already beeing processed
-                    if ( cache[ elem.data.src ].status === 'decrypted' ) {
+                    if ( cache[ fileURL ].status === 'decrypted' ) {
                         // If decrypted content is ready, we update URL
-                        elem.data.src = cache[ elem.data.src ].url;
-                        cache[ elem.data.src ].elements.push( id );
+                        if ( elem.attribute === 'src' ) {
+                            elem.data.src  = cache[ fileURL ].url;
+                        }
+                        else {
+                            elem.data.href = cache[ fileURL ].url;
+                        }
+                        cache[ fileURL ].elements.push( { 'id' : id, 'attribute' : elem.attribute } );
                     }
                     else {
                         // Otherwise we add id, so URL will be updated once we receive decrpted content
-                        cache[ elem.data.src ].elements.push( id );
+                        cache[ fileURL ].elements.push( { 'id' : id, 'attribute' : elem.attribute } );
                     }
                 }
             }
@@ -251,8 +275,12 @@ function getElements( root ) {
 
     while ( node ) {
         text = node.innerHTML.trim();
-        if ( node.hasAttribute( 'src' ) && ( node.src.toLowerCase().endsWith( '.gpg' ) || node.src.toLowerCase().endsWith( '.asc' ) ) ) {
-            arr.push( { 'data' : node, 'type' : 'file', 'preParsedData' : null } );
+        if ( node.hasAttribute( 'src' ) && node.src && ( node.src.toLowerCase().endsWith( '.gpg' ) || node.src.toLowerCase().endsWith( '.asc' ) ) ) {
+            arr.push( { 'data' : node, 'type' : 'file', 'preParsedData' : null, 'attribute' : 'src' } );
+        }
+
+        if ( node.hasAttribute( 'href' ) && node.href && ( node.href.toLowerCase().endsWith( '.gpg' ) || node.href.toLowerCase().endsWith( '.asc' ) ) ) {
+            arr.push( { 'data' : node, 'type' : 'file', 'preParsedData' : null, 'attribute' : 'href' } );
         }
 
         if ( node.children.length == 0 && text.startsWith( '-----BEGIN PGP MESSAGE-----' ) && text.match( armouredRegex ) ) {
